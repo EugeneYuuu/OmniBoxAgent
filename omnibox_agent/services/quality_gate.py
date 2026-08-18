@@ -422,7 +422,7 @@ def _split_sentences(text: str) -> list[str]:
 
 # ── Token budget fitting (§6) ────────────────────────────────────────────
 
-def fit_budget(docs: list[dict], budget: int) -> list[dict]:
+def fit_budget(docs: list[dict], budget: int, top_k_complete: int = 1) -> list[dict]:
     """Fit docs into a token budget, sorted by relevance score.
 
     v4.1 §6: Top-1 always complete. Others truncated at tail if needed.
@@ -450,8 +450,8 @@ def fit_budget(docs: list[dict], budget: int) -> list[dict]:
         # Rough token estimate: 1 Chinese char ≈ 1.5 tokens, 1 English word ≈ 1 token
         token_est = int(char_count * 1.2)
 
-        if i == 0:
-            # Top-1 always complete
+        if i < top_k_complete:
+            # 前 top_k_complete 条无条件完整（默认 1 = 原行为，simple QA 零回归）
             result.append(doc)
             used += token_est
         elif used + token_est > budget:

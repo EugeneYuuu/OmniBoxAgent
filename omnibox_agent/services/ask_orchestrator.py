@@ -294,7 +294,13 @@ def retrieve_pipeline(
     # judge on real content. Fused dicts only carry `title` by default, so the
     # gate would otherwise see empty bodies and mis-judge everything.
     for item in top_n:
-        detail = content_map.get(item["content_id"])
+        cid = item["content_id"]
+        detail = content_map.get(cid)
+        # 修复：fused item 的 content_id 是 str（Chroma metadata），content_map
+        # 的 key 是 int（MySQL id），类型不匹配会导致 get 恒 None → summary 永远
+        # 补不上，正文只能残留在 document 字段。此处对 str 数字做 int 回退。
+        if detail is None and isinstance(cid, str) and cid.isdigit():
+            detail = content_map.get(int(cid))
         if detail:
             summary = detail.get("summary", "") or ""
             item.setdefault("summary", summary)

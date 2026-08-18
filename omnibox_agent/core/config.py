@@ -188,7 +188,10 @@ class EvalConfig:
 class GenerationConfig:
     """v4.1 Layer 3 generation configuration."""
     context_token_budget: int = 3000     # 检索内容注入上限（bounded 查询）
-    synthesize_token_budget: int = 6000  # 合成输入上限
+    synthesize_token_budget: int = 15000  # 合成输入上限
+    # DAG sub-agent 单 section 详情注入上限（独立于 simple QA 的 context_token_budget，
+    # 避免调大公共值波及 simple QA；配合 fit_budget top_k_complete 保前 N 条完整）
+    creative_context_token_budget: int = 15000
     # Wider budget used for unbounded aggregation / summary queries so the
     # whole主题范畴 actually reaches the LLM after the gate.
     unbounded_context_token_budget: int = 12000
@@ -301,12 +304,10 @@ class ClarifyConfig:
 # 模型上下文窗口映射（保守值；未命中用 MemoryConfig.default_window_tokens）。
 # 用户自带模型窗口各异，Compaction 触发与上下文预算按此映射，避免小窗口模型溢出。
 MODEL_WINDOWS: dict[str, int] = {
-    "glm-4-flash": 32768,
-    "glm-4": 128000,
-    "deepseek-chat": 64000,
-    "deepseek-reasoner": 64000,
-    "qwen-plus": 32000,
-    "qwen-max": 32000,
+    "glm-4-flash": 	128000,
+    "glm-5": 128000,
+    "deepseek-v4-flash": 384000,
+    "deepseek-v4-pro": 384000,
 }
 
 
@@ -324,7 +325,7 @@ class MemoryConfig:
     """
     enabled: bool = True              # ⚠️ V2.0 默认开（原 False）；env: MEMORY_ENABLED，false=部署层熔断
     whitelist_users: list[str] = field(default_factory=list)   # 废弃：读入仅记 warning，不参与判定（§17）
-    default_window_tokens: int = 32768
+    default_window_tokens: int = 384000
     reply_max_tokens: int = 4096
     reserve_tokens: int = 500
     keep_recent_tokens: int = 6000
@@ -539,7 +540,8 @@ def load_config() -> Config:
         ),
         generation=GenerationConfig(
             context_token_budget=int(os.getenv("CONTEXT_TOKEN_BUDGET", "3000")),
-            synthesize_token_budget=int(os.getenv("SYNTHESIZE_TOKEN_BUDGET", "6000")),
+            synthesize_token_budget=int(os.getenv("SYNTHESIZE_TOKEN_BUDGET", "15000")),
+            creative_context_token_budget=int(os.getenv("CREATIVE_CONTEXT_TOKEN_BUDGET", "15000")),
             unbounded_context_token_budget=int(os.getenv("UNBOUNDED_CONTEXT_TOKEN_BUDGET", "12000")),
         ),
         clarify=ClarifyConfig(

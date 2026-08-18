@@ -109,8 +109,10 @@ async def sub_agent_solve(
     # 3. Refine (>300 char docs)
     try:
         relevant = await refine_docs(relevant, query, gate_ctx)
-        budget = cfg.generation.context_token_budget
-        relevant = fit_budget(relevant, budget)
+        # DAG 用独立 creative_context_token_budget（15000），配合 top_k_complete=15
+        # 保证前 15 条完整注入；不碰 simple QA 的 context_token_budget(3000)。
+        budget = cfg.generation.creative_context_token_budget
+        relevant = fit_budget(relevant, budget, top_k_complete=15)
     except Exception as e:
         log.warning("sub_agent_solve[%s]: refine failed: %s", task.id, e)
 
@@ -665,18 +667,28 @@ def _build_section_prompt(
     # Format retrieved context
     context_parts = []
     for i, d in enumerate(docs):
-        title = d.get("title", "")
-        summary = d.get("summary", "") or d.get("content", "")
-        comments = d.get("comments_context", "")
+        title = str(d.get("title") or "")
         cid = d.get("content_id", "")
 
         # 评论补充命中：正文未直接匹配查询，仅评论区提及 — 标注可信度
         match_note = "（评论补充命中：正文未直接匹配，评论为唯一依据）" if d.get("is_comment_match") else ""
 
+        # 正文 + media 详情：document 是 main 向量文本（title + 平台正文），
+        # media_text / main_text 是图片/视频解析（字段随 vec_type 漂移）。三者
+        # 任一非空即拼入，不做 vec_type 判断；summary 字段此前因 content_id
+        # 类型不匹配（str vs int）恒为空，故此处直接取 document，不再依赖 summary。
+        parts = []
+        for k in ("document", "media_text", "main_text"):
+            v = str(d.get(k) or "").strip()
+            if v and v != title and v not in parts:
+                parts.append(v)
+        body = "\n".join(parts) or str(d.get("summary") or d.get("content") or "").strip()
+
         item_text = (
             f"[{i+1}] 标题: {title}{match_note}\n"
-            f"内容: {summary[:500]}\n"
+            f"内容: {body[:1800]}\n"
         )
+        comments = str(d.get("comments_context") or "").strip()
         if comments:
             item_text += f"评论补充（可能包含地点、价格、tips等额外信息）: {comments}\n"
         item_text += f"content_id: {cid}"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from typing import Any
 
 from omnibox_agent.core.config import get_config
@@ -65,6 +66,99 @@ def _get_creative_whitelist() -> str:
     return os.getenv("CREATIVE_WHITELIST", "")
 
 
+# ── 主题锚定（V3：会话既定主题确定性到达检索，不依赖 LLM 规则0）──────
+
+# resume 补充包裹里原始问题一定在首行；分隔符由后端/stream_pipeline 两处生成
+# 并不统一，故 query 取首行剥离补充尾巴，而非枚举分隔符。
+_DIM_RE = re.compile(r"\d+[天日]\s*[晚夜]\d{0,1}|\d+[天日晚夜]|\d+(?:\.\d+)?|\d{1,2}[:：]\d{2}")
+
+# 无主题识别价值词（收藏/行程/程度/虚词）。命中即视为"非主题"，不参与锚定。
+_TOPIC_GENERIC_WORDS = {
+    "收藏", "内容", "干货", "最近", "最新", "今天", "昨天", "本周", "本月",
+    "多少", "几条", "哪些", "攻略", "打卡", "经典", "全面", "穷游", "省钱",
+    "奢华", "亲子", "自由行", "跟团", "行程", "安排", "规划", "预算", "花费",
+    "费用", "明细", "美食", "景点", "住宿", "酒店", "交通", "出行", "签证",
+    "汇率", "天气", "旅游", "旅行", "纯玩", "推荐", "时间", "节奏", "风格",
+    "选项", "补充", "用户", "我", "想", "要", "做", "给", "帮", "下", "个",
+    "怎么", "如何", "了", "还是", "还是说", "的话", "一", "二", "三", "四",
+    "五", "两", "等", "和", "与", "及", "的", "N", "X", "我要", "能", "会",
+    "计划", "打算", "准备", "出去", "去", "去玩", "游玩", "想要", "一起",
+}
+
+
+def _strip_dims(text: str) -> str:
+    """丢掉 5天4晚 / 数字 / 时刻等无关维度信息。"""
+    return _DIM_RE.sub(" ", text or "")
+
+
+def _strip_supplement(query: str) -> str:
+    """query 专用：取首个非空行（原始问题），丢弃 resume 补充尾巴，再去维度词。"""
+    for line in (query or "").split("\n"):
+        line = line.strip()
+        if line:
+            return _strip_dims(line)
+    return ""
+
+
+def _topic_nouns(text: str, *, first_line_only: bool = False) -> set[str]:
+    """jieba 分词 → 清理 → 返回非泛化实义主题词（如 巴厘岛/上海/北京）。
+
+    first_line_only=True 仅用于 query（剥离补充尾巴）；会话消息须扫全文
+    （first_line_only=False），否则多行 assistant 长回答会被截成标题行，
+    正文里的主题词漏计导致频次门误杀。
+    """
+    import jieba
+    src = _strip_supplement(text) if first_line_only else _strip_dims(text)
+    out: set[str] = set()
+    for w in jieba.cut(src):
+        w = w.strip()
+        if len(w) < 2 or w.lower() in _TOPIC_GENERIC_WORDS:
+            continue
+        if not re.search(r"[\u4e00-\u9fff]", w):  # 纯数字/字母/符号 → 非主题
+            continue
+        out.add(w)
+    return out
+
+
+def _session_topic(recent_msgs: list[dict], query: str) -> str:
+    """从会话近期消息提取既定的单一主题；带显著门，歧义则放弃（防误锚）。"""
+    stats: Counter = Counter()
+    for m in recent_msgs:
+        for w in _topic_nouns(m.get("content") or ""):
+            stats[w] += 1
+    if not stats:
+        return ""
+    top2 = stats.most_common(2)
+    # 显著门：最高频需 ≥2 次，否则仅在 query 本身命中某主题词时采用
+    if top2[0][1] < 2:
+        for w in _topic_nouns(query, first_line_only=True):
+            if stats.get(w):
+                return w
+        return ""
+    # 双主题并打 → 语义歧义，放弃（防误锚）
+    if len(top2) > 1 and top2[0][1] == top2[1][1]:
+        return ""
+    return top2[0][0]
+
+
+def resolve_topic_anchor(query: str, recent_msgs: list[dict]) -> dict:
+    """判定是否需把会话主题锚定进查询，以及动作：anchor / override / none。
+
+    - anchor:    query 无自有主题、会话有显著主题 → 用会话主题改写查询
+    - override:  query 自带明确主题且 ≠ 会话主题 → 不锚定，压制会话旧主题
+    - none:      已自带同主题 / 无历史 / 歧义 → 不改写
+    """
+    own = _topic_nouns(query, first_line_only=True)
+    st = _session_topic(recent_msgs, query)
+    if own and st and st in own:
+        return {"action": "none", "session_topic": st}
+    if own and st and st not in own:
+        return {"action": "override", "session_topic": st}
+    if not own and st:
+        return {"action": "anchor", "session_topic": st}
+    return {"action": "none", "session_topic": ""}
+
+
 # ── Planner (§9.2) ──────────────────────────────────────────────────────
 
 async def plan(query: str, ctx: Any = None) -> PlanOutput:
@@ -85,9 +179,50 @@ async def plan(query: str, ctx: Any = None) -> PlanOutput:
     Returns:
         PlanOutput with tasks list and validity flag.
     """
+    # ---- 主题锚定 + 显式主题守卫（best-effort，误判默认不改写）----
+    # 会话既定主题必须确定性到达检索：省略主题的追问（如"我要玩5天4晚"）会由
+    # resolve_topic_anchor 判定 anchor，把会话主题拼入 plan_query，让所有子任务
+    # query 继承该主题；query 自带明确主题且与会话记忆不同则 override（不锚定，
+    # 靠 prompt 强约束压制旧主题）。误判/无数据时 action==none，退化为现状。
+    anchored = {"action": "none", "session_topic": ""}
+    anchored_topic = None
+    try:
+        if ctx is not None:
+            sctx = ctx.input.get("session_context")
+            recent_msgs = list((sctx or {}).get("recent") or [])
+            if not recent_msgs:
+                recent_msgs = [
+                    m for m in (ctx.input.get("history") or [])
+                    if isinstance(m, dict) and (m.get("content") or "").strip()
+                ]
+            anchored = resolve_topic_anchor(query, recent_msgs)
+    except Exception as e:
+        log.warning("Topic anchor resolution failed (best-effort): %s", e)
+
+    plan_query = query
+    if anchored["action"] == "anchor":
+        plan_query = f"{anchored['session_topic']} {query}"
+        anchored_topic = anchored["session_topic"]
+        if ctx is not None:
+            ctx.input["_anchored_query"] = plan_query  # 可观测（仅展示，不参与数据流）
+        from omnibox_agent.core.trace_recorder import trace_event
+        trace_event("creative.topic_anchor", phase="creative", data={
+            "action": "anchor", "session_topic": anchored_topic,
+            "rewritten": plan_query[:80]})
+        log.info("Topic anchor: '%s' -> '%s'", query, plan_query)
+    elif anchored["action"] == "override":
+        if ctx is not None:
+            ctx.input["_anchored_override"] = True
+        from omnibox_agent.core.trace_recorder import trace_event
+        trace_event("creative.topic_anchor", phase="creative", data={
+            "action": "override", "session_topic": anchored["session_topic"]})
+        log.info("Topic anchor: query self-topic=%s, session memory ignored", query[:40])
+
     messages = [
-        {"role": "system", "content": _build_planner_prompt()},
-        {"role": "user", "content": f"用户查询: {query}\n\n请拆分为子任务。"
+        {"role": "system",
+         "content": _build_planner_prompt(
+             ignored_history=(anchored["action"] == "override"))},
+        {"role": "user", "content": f"用户查询: {plan_query}\n\n请拆分为子任务。"
          "注意:每个子任务的query必须包含用户查询的核心关键词,"
          "不要替换为更具体的子类型;若会话历史显示该查询省略了主题(只给了维度词、"
          "未说主题名词),请先把历史主题补全进query再拆分。"},
@@ -148,7 +283,7 @@ async def plan(query: str, ctx: Any = None) -> PlanOutput:
             # 解析失败整体降级 QA。结构化输出不需要思考，直接关掉最稳。
             no_thinking=True,
         )
-        return _parse_plan(raw, query)
+        return _parse_plan(raw, plan_query, anchored_topic=anchored_topic)
     except Exception as e:
         log.warning("Planner failed: %r — will fallback to QA", e)
         from omnibox_agent.core.trace_recorder import trace_event
@@ -157,9 +292,13 @@ async def plan(query: str, ctx: Any = None) -> PlanOutput:
         return PlanOutput(valid=False, error=repr(e))
 
 
-def _build_planner_prompt() -> str:
-    """Build the system prompt for the planner LLM."""
-    return (
+def _build_planner_prompt(ignored_history: bool = False) -> str:
+    """Build the system prompt for the planner LLM.
+
+    ignored_history=True：当前查询已自带明确主题（且与会话记忆主题不同），
+    必须在 prompt 中强约束"以自带主题为准、压制会话旧主题"，防止被历史带偏。
+    """
+    base = (
         "你是一个任务规划器。将用户的复杂查询拆分为多个子任务。\n\n"
         "重要背景:用户的收藏来自小红书、抖音等平台,是个人笔记/帖子,"
         "不是专业数据库。检索query必须足够宽泛以匹配这些非结构化内容。\n\n"
@@ -171,14 +310,15 @@ def _build_planner_prompt() -> str:
         '- type: "section" 或 "retrieval_variant"\n'
         '- query: 该子任务的检索查询词\n'
         '- filters: 结构化过滤(可选)\n'
-        '- constraints: 内容约束(可选)\n'
+        '- constraints: 内容约束(可选)。必须是 "{\"要点\": \"描述\"}" 形式的 JSON 对象，'
+        '禁止写成 "{\"纯中文文案\"}"（缺少 key 和冒号会破坏 JSON，导致整个规划失败）\n'
         '- requires: 依赖的其他子任务produces键(数组)\n'
         '- produces: 本任务产出的共享状态键(数组)\n\n'
         "规则:\n"
         "0. 【主题补全·最高优先】先结合会话历史（system 中的 <session_history>）判断"
         "当前查询是否省略了主题：只有当历史里正围绕某个具体主题展开、且当前查询只给出"
         "维度词而未出现任何新的主题名词时，才把历史中的该主题补全进子任务 query"
-        "（写成「历史主题 + 当前维度词」），严禁照抄省略了主题的原始查询。"
+        "（写成「会话主题 + 当前维度词」），严禁照抄省略了主题的原始查询。"
         "若当前查询已明确说出自己的主题名词，则忽略历史主题，不要强加。\n"
         "1. section间默认独立,只在真正需要上游数据时才用requires/produces建立依赖。"
         "内容生成类章节不需要互相依赖\n"
@@ -201,9 +341,22 @@ def _build_planner_prompt() -> str:
         "只输出JSON数组,不要其他文字。格式:\n"
         '[{"id":"a","type":"section","query":"...","filters":{},"constraints":{},"requires":[],"produces":[]}]'
     )
+    if ignored_history:
+        base += (
+            "\n\n7. 【当前查询已自带明确主题·最高优先】本查询本身已明确指定主题名词，"
+            "必须以其自带主题为准。会话历史里的旧主题仅供理解上下文，"
+            "**不得**覆盖或混入当前查询的自带主题，也不得因为历史里存在旧主题就改变检索方向。"
+        )
+    else:
+        base += (
+            "\n\n7. 【主题补全·代码锚定】若本查询已由系统补入会话主题（形如「会话主题 + 查询」），"
+            "子任务 query 必须保留该主题词，不得拆回无主题的维度词。"
+        )
+    return base
 
 
-def _parse_plan(raw: str, original_query: str) -> PlanOutput:
+def _parse_plan(raw: str, original_query: str,
+                anchored_topic: str | None = None) -> PlanOutput:
     """Parse LLM output into PlanOutput.
 
     Handles JSON wrapped in code blocks or plain text.
@@ -229,6 +382,16 @@ def _parse_plan(raw: str, original_query: str) -> PlanOutput:
     arr_match = re.search(r'\[.*\]', text, re.DOTALL)
     if arr_match:
         text = arr_match.group(0)
+
+    # 容错：planner 偶发（约 4.5%）会把 constraints 写成"裸字符串对象"
+    # 如 `"constraints":{"需基于帖子内容提炼"}`（缺 key:value 的冒号），
+    # 导致整个 JSON 解析失败。此处只对"值内无冒号"的 constraints 降级为 {}，
+    # 正常 `{"key":"value"}`（含冒号）保持不变——零副作用、零回归。
+    text = re.sub(
+        r'"constraints"\s*:\s*\{([^{}]*)\}',
+        lambda m: '"constraints":{}' if ':' not in m.group(1) else m.group(0),
+        text,
+    )
 
     try:
         tasks_data = json.loads(text)
@@ -272,7 +435,8 @@ def _parse_plan(raw: str, original_query: str) -> PlanOutput:
 
     # Programmatic guard: ensure at least one task has a broad query
     # that preserves the original query's core keywords.
-    tasks = _ensure_broad_search_task(tasks, original_query)
+    tasks = _ensure_broad_search_task(tasks, original_query,
+                                      anchored_topic=anchored_topic)
 
     log.info("Planner: %d tasks — %s", len(tasks),
              [(t.id, t.type) for t in tasks])
@@ -285,7 +449,8 @@ def _parse_plan(raw: str, original_query: str) -> PlanOutput:
 
 
 def _ensure_broad_search_task(
-    tasks: list[SubTask], original_query: str
+    tasks: list[SubTask], original_query: str,
+    anchored_topic: str | None = None,
 ) -> list[SubTask]:
     """Ensure EVERY section task's query stays inside the query's superset.
 
@@ -342,6 +507,11 @@ def _ensure_broad_search_task(
         core_words = [core]
 
     def is_broad(t: SubTask) -> bool:
+        # anchor 场景：子任务含会话主题即视为在全集内（主题确定性到达即可，
+        # 不强求含完整 core 的动词性片段如"我要玩5天4晚"，保留 LLM 差异化拆解）。
+        # 非 anchor（anchored_topic=None）时该分支不生效，行为与现状逐字节等价。
+        if anchored_topic and anchored_topic in t.query:
+            return True
         # 子任务包含去虚字后的核心串 → 在用户查询全集内（维度词不影响）。
         if _core_clean and _core_clean in t.query:
             return True
