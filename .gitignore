@@ -1,0 +1,82 @@
+# ============================================================
+# OmniBoxAgent .gitignore
+# 分类：环境文件 / 隐私文件 / 临时文件 / 构建与运行产物
+# ============================================================
+
+# ---------- 环境文件（含密钥，禁止提交） ----------
+.env
+.env.*
+
+website/
+trace_fallabck/
+fix_deepseek_config.sql
+docs/
+
+# ---------- 隐私 / 敏感配置文件 ----------
+# 含真实 token（如 MODELSCOPE_TOKEN），勿提交；
+# 建议另行提供 mcp_servers.example.json 作为模板
+mcp_servers.json
+
+# ---------- 本地数据与数据库（隐私 / 运行时产物） ----------
+# 向量库持久化数据
+chroma_data/
+# 本地业务数据库
+data/
+# 对话追踪日志（可能含隐私内容）
+trace_fallback/
+*.sqlite3
+*.db
+*.sqlite
+
+# ---------- Python 缓存与编译产物 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 构建 / 打包产物 ----------
+build/
+dist/
+*.egg-info/
+*.egg
+eggs/
+.eggs/
+
+# ---------- 测试与覆盖率产物 ----------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache/
+
+# ---------- 日志与临时文件 ----------
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*~
+
+# ---------- 操作系统 / 编辑器 ----------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+*.code-workspace
+.idea/
+.vscode/
+*.sublime-workspace
+
+# ---------- 本地运行时数据（WorkBuddy 项目态） ----------
+.workbuddy/

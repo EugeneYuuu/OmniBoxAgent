@@ -1,0 +1,24 @@
+[
+  {
+    "name": "comparison_table",
+    "description": "对比类查询的表格输出规范：对比/区别/vs/比较类查询强制用 Markdown 表格输出，每格附 content://N 引用",
+    "tags": ["对比", "区别", "vs", "比较"],
+    "version": "1.0",
+    "path": "",
+    "resources": [],
+    "enabled": true,
+    "created_at": "2026-08-17T00:49:00+08:00",
+    "updated_at": "2026-08-17T00:49:00+08:00"
+  },
+  {
+    "name": "travel_guide",
+    "description": "旅行类收藏的解读规范：旅行/攻略/行程/打卡/酒店类查询按行程安排/花费明细/打卡点/避坑提示四维度分节输出，引用原始笔记",
+    "tags": ["旅行", "攻略", "行程", "打卡", "酒店"],
+    "version": "1.0",
+    "path": "",
+    "resources": [],
+    "enabled": true,
+    "created_at": "2026-08-17T01:01:00+08:00",
+    "updated_at": "2026-08-17T01:01:00+08:00"
+  }
+]
