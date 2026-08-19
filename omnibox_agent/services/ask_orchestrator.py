@@ -258,6 +258,54 @@ def retrieve_pipeline(
     else:
         fused.sort(key=lambda x: x["rrf_score"], reverse=True)
 
+        # ── 精召回（rerank）：RRF 融合 + LT 软加权 + 排序之后、eff_top_n 截取之前 ──
+        # 门控（RAG_TWO_STAGE_RETRIEVAL_DESIGN.md §2）——精排覆盖所有语义检索，
+        # 无论是否显式指定条数；「没指定条数」同样精排、只是下游 eff_top_n=None
+        # 不截断（全量返回）。仅排除：
+        #   1. COUNT / EXIST_CHECK（计数/存在检查，结果只取 total_count，精排无意义）
+        #   2. want_classify（分类需全量分组，精排会卷乱分组）
+        # 时间列举（time_listing）由外层 if/else 排除（走时间排序分支，不进精排）。
+        # 为何不依赖 intent==SEARCH_AND_SUMMARIZE 正向判定：线上 QU 走用户 LLM
+        # （deepseek-v4-flash），实测把所有「推荐 N 条 X」都判成 GENERAL_LIST
+        # （从不输出 search_and_summarize），正向判定会让精排大面积漏触发——排除法。
+        intent_is_semantic = (
+            qu_result.intent not in (Intent.COUNT, Intent.EXIST_CHECK)
+            and not want_classify
+        )
+        if cfg.rerank_enabled and cfg.rerank_api_key and intent_is_semantic:
+            # 评论命中不进精排：is_comment_match 附尾不变量（下方截取块）会把
+            # 评论条目强制扔回队尾，精排信号对评论条目被完全废掉，行为自相
+            # 矛盾——评论通道保持 RRF 降权 + 附尾不变量。
+            cands = [it for it in fused
+                     if not it.get("is_comment_match")]
+            # 精排覆盖全部粗排召回的非评论候选（不截到 rerank_max_candidates）：
+            # 分批交给 rerank_service 处理（每批 ≤ rerank_max_candidates 单次请求）。
+            # 空候选短路：fused 全是评论命中（或为空）时 cands 为空，SiliconFlow
+            # documents 要求 ≥1，空列表必然 4xx——不短路会白付一次必败往返。
+            if cands:
+                try:
+                    from omnibox_agent.services.rerank_service import rerank
+                    # rerank 服务内部把 relevance_score 写回 item["rerank_score"]
+                    # （0~1，不覆盖 rrf_score）；下游 fit_budget/_drill_comments
+                    # 按 rerank_score 优先定序、缺省回退 rrf_score（quality_gate.py）。
+                    ordered = rerank(search_query, cands, top_n=len(cands))
+                    # content_id 统一 str 化后再建集合：Chroma metadata 为 str、
+                    # _extract_content_id 兜底为 int，混型会让 ordered_ids 集合与
+                    # rest 里的 content_id 无法 match，导致 ordered 里的条目被
+                    # rest 重复追加（同一内容出现两次）。fused 本身已由
+                    # _rrf_fusion 的 dict 保证 content_id 唯一，此处只对齐类型。
+                    ordered_ids = {str(it["content_id"]) for it in ordered}
+                    fused = ordered + [it for it in fused
+                                       if str(it["content_id"]) not in ordered_ids]
+                    log.info("rerank applied: %d candidates reranked (limit_count=%d)",
+                             len(ordered), limit_count)
+                except Exception as e:
+                    log.warning("rerank fallback to RRF order: %s", e)
+                    # 降级可观测（设计 §4.10：禁止静默吞异常）；fused 保持原 rrf 顺序
+                    from omnibox_agent.core.trace_recorder import trace_event
+                    trace_event("qa.rerank_fallback", phase="qa",
+                                data={"reason": str(e)[:200]})
+
     # Statistics derived from the fused set (consistent with what is shown).
     total_count = len(fused)
     if qu_result.intent == Intent.COUNT:

@@ -215,7 +215,13 @@ async def _drill_comments(docs: list[dict], ctx: Any) -> None:
         return
     targets = sorted(
         docs,
-        key=lambda d: d.get("rrf_score", d.get("score", 0.0)),
+        # rerank_score 优先（RAG 两阶段检索方案 B）：精排条目按云端相关度定序；
+        # 未精排条目（评论命中 / 降级回退 / 非 rerank 路径）rerank_score 缺省，
+        # 回退 rrf_score——与改造前行为一致。注意 is not None 而非 or：
+        # relevance_score 可能为 0（相关度最低），or 会误判为缺省。
+        key=lambda d: (d.get("rerank_score")
+                       if d.get("rerank_score") is not None
+                       else d.get("rrf_score", d.get("score", 0.0))),
         reverse=True,
     )[:max_items]
     ids = [d.get("content_id") for d in targets if d.get("content_id") is not None]
@@ -431,14 +437,20 @@ def fit_budget(docs: list[dict], budget: int, top_k_complete: int = 1) -> list[d
     if not docs:
         return []
 
-    # Sort by fusion score descending. Prefer rrf_score (RRF fusion ordering:
-    # main/media primary before comment supplement) over the raw per-vector
-    # similarity `score` — a comment-matched note's raw similarity is often
+    # Sort by relevance score descending. rerank_score 优先（RAG 两阶段检索
+    # 方案 B）：精排条目按云端相关度定序；未精排条目（评论命中 / 降级回退 /
+    # 非 rerank 路径）rerank_score 缺省，回退 rrf_score（RRF fusion ordering:
+    # main/media primary before comment supplement）再回退 raw per-vector
+    # similarity `score` —— a comment-matched note's raw similarity is often
     # higher than a primary note's, and sorting by it would let comment
     # supplements crowd out primary matches inside the token budget.
+    # 注意 is not None 而非 or：relevance_score 可能为 0（相关度最低），
+    # or 会误判为缺省、错误回退到 rrf_score。
     sorted_docs = sorted(
         docs,
-        key=lambda d: d.get("rrf_score", d.get("score", 0.0)),
+        key=lambda d: (d.get("rerank_score")
+                       if d.get("rerank_score") is not None
+                       else d.get("rrf_score", d.get("score", 0.0))),
         reverse=True,
     )
 

@@ -65,9 +65,9 @@ class SyncConfig:
 @dataclass
 class RetrievalConfig:
     top_n: int = 5
-    # 粗召回 topk（第一阶段，向量召回）：50~100。这是语义相似度召回预算，
+    # 粗召回 topk（第一阶段，向量召回）：100。这是语义相似度召回预算，
     # 决定进 RRF 融合的候选数量上限。时间列举类查询会被全库召回覆盖以保新收藏。
-    candidate_n: int = 50
+    candidate_n: int = 100
     recency_top_n: int = 50
     # 精召回 topk（第二阶段，排序后截取）：20~50。粗召回融合并排序后，
     # 用户未显式指定条数时按此截取进入门控/生成。用户问题自带 topk（limit_count）
@@ -100,6 +100,23 @@ class RetrievalConfig:
     # 仅作 ChromaDB 查询必要的 n_results 防御上限（取 min(库向量总数, 该值)），
     # 要真正覆盖更大库就调大该值。
     retrieval_max_candidates: int = 5000
+    # ── RAG 两阶段检索 · 精召回（云端 rerank，RAG_TWO_STAGE_RETRIEVAL_DESIGN.md §6）──
+    # 精排开关，关闭等价老 RRF 排序；api_key 为空时检索层会短路视为 disabled。
+    rerank_enabled: bool = True
+    rerank_api_url: str = "https://api.siliconflow.cn"
+    rerank_api_key: str = ""
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    # 精排候选上限（自设防线值：官方未标注 documents 上限，真实约束是 TPM 计费）。
+    # 门控同时要求 limit_count ≤ 该值，防止"rerank 前 100 + RRF 余量"混合序。
+    rerank_max_candidates: int = 100
+    # HTTP 显式超时：retrieve_pipeline 跑在 run_blocking 有界线程池（8 ticket），
+    # 无超时的慢调用会占住线程位（ExecutorBusyError 风险，§4.9）。
+    rerank_timeout_s: float = 5.0
+    # 单文档送精排的字符截断，控 input_tokens 计费。
+    rerank_doc_max_chars: int = 2000
+    # 失败重试次数上限（指数退避）。必须严格限死——重试会让单个请求占住
+    # 共享线程池 ticket 远超 rerank_timeout_s（§4.9 线程池竞争约束）。
+    rerank_max_retries: int = 1
     tag_boost_factor: float = 0.15
     freshness_lambda: float = 0.01
     # Comment enrichment is now per-item, per-sub-task inside the DAG
@@ -450,7 +467,7 @@ def load_config() -> Config:
         ),
         retrieval=RetrievalConfig(
             top_n=int(os.getenv("RETRIEVAL_TOP_N", "5")),
-            candidate_n=int(os.getenv("RETRIEVAL_CANDIDATE_N", "50")),
+            candidate_n=int(os.getenv("RETRIEVAL_CANDIDATE_N", "100")),
             recency_top_n=int(os.getenv("RECENCY_TOP_N", "50")),
             refine_top_n=int(os.getenv("RETRIEVAL_REFINE_TOP_N", "20")),
             unbounded_top_n=int(os.getenv("RETRIEVAL_UNBOUNDED_TOP_N", "100")),
@@ -462,6 +479,16 @@ def load_config() -> Config:
             rrf_comment_weight=float(os.getenv("RRF_COMMENT_WEIGHT", "0.3")),
             comment_candidate_n=int(os.getenv("RETRIEVAL_COMMENT_CANDIDATE_N", "200")),
             retrieval_max_candidates=int(os.getenv("RETRIEVAL_MAX_CANDIDATES", "5000")),
+            # RAG 精召回（rerank）：api_key 优先读 SILICONFLOW_API_KEY（与
+            # SiliconFlow 官方变量名对齐），也可用 RERANK_API_KEY 显式覆盖。
+            rerank_enabled=os.getenv("RERANK_ENABLED", "true").lower() == "true",
+            rerank_api_url=os.getenv("RERANK_API_URL", "https://api.siliconflow.cn"),
+            rerank_api_key=os.getenv("RERANK_API_KEY") or os.getenv("SILICONFLOW_API_KEY", ""),
+            rerank_model=os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3"),
+            rerank_max_candidates=int(os.getenv("RERANK_MAX_CANDIDATES", "100")),
+            rerank_timeout_s=float(os.getenv("RERANK_TIMEOUT_S", "5.0")),
+            rerank_doc_max_chars=int(os.getenv("RERANK_DOC_MAX_CHARS", "2000")),
+            rerank_max_retries=int(os.getenv("RERANK_MAX_RETRIES", "1")),
             tag_boost_factor=float(os.getenv("TAG_BOOST_FACTOR", "0.15")),
             freshness_lambda=float(os.getenv("FRESHNESS_LAMBDA", "0.01")),
         ),
